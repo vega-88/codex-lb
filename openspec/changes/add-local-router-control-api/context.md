@@ -1,0 +1,6 @@
+# Context
+The control API is enabled by an owner-only data-dir/router-control.key. It rejects browser Origin headers and non-loopback peers. LB alone refreshes OAuth credentials, using existing refresh coordination and separate refresh sessions. Only access tokens leave LB. Router authenticates locally without an outbound proxy; all OpenAI traffic still requires the configured upstream proxy.
+
+Snapshots carry routing policy, account status, quota freshness and the existing primary/secondary budget settings. Unsupported router strategies fail clearly. Request events contain bounded metadata and usage, never prompts or credentials. A durable router outbox retries delivery. LB serializes receipt check and append in one database transaction (SQLite BEGIN IMMEDIATE; PostgreSQL transaction advisory lock), uses a namespaced event ID and rejects changed payloads for the same ID. Dashboard requested_at is ingestion time to avoid inserting below a completed usage-rollup watermark after an outage; latency retains actual elapsed time. Existing LB proxy paths remain available during migration.
+
+Example: Router selects Team from a snapshot, obtains its current access token, sends Responses through the required SOCKS proxy, then submits one terminal event. A lost acknowledgement causes a duplicate delivery with the same ID and no extra dashboard row.

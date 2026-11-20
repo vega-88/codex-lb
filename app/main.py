@@ -99,6 +99,7 @@ from app.modules.quota_planner.scheduler import build_quota_planner_scheduler
 from app.modules.rate_limit_reset_credits import api as rate_limit_reset_credits_api
 from app.modules.reports import api as reports_api
 from app.modules.request_logs import api as request_logs_api
+from app.modules.router_control import api as router_control_api
 from app.modules.runtime import api as runtime_api
 from app.modules.settings import api as settings_api
 from app.modules.sticky_sessions import api as sticky_sessions_api
@@ -835,6 +836,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboard_api.router)
     app.include_router(usage_api.router)
     app.include_router(request_logs_api.router)
+    app.include_router(router_control_api.router)
     app.include_router(request_logs_api.conversations_router)
     app.include_router(quota_planner_api.router)
     app.include_router(reports_api.router)
