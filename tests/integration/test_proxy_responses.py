@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from collections.abc import Mapping
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import cast
 
@@ -19,14 +21,312 @@ from app.core.config.settings import Settings
 from app.core.openai.models import CompactResponsePayload
 from app.core.types import JsonValue
 from app.core.utils.time import utcnow
-from app.db.models import Account, DashboardSettings, RequestLog
+from app.db.models import (
+    Account,
+    AccountStatus,
+    DashboardSettings,
+    HttpBridgeSessionAlias,
+    HttpBridgeSessionRecord,
+    RequestLog,
+    UsageHistory,
+)
 from app.db.session import SessionLocal
 from app.modules.api_keys.service import ApiKeyUsageReservationData
 from app.modules.proxy._service.streaming import retry as streaming_retry_module
+from app.modules.proxy.durable_bridge_repository import durable_bridge_api_key_scope, durable_bridge_hash
 from app.modules.request_logs.repository import RequestLogsRepository
 from app.modules.usage.repository import AdditionalUsageRepository
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.parametrize(
+    ("path", "model", "anchor", "expected_stream", "expected_affinity"),
+    [
+        ("/backend-api/codex/responses", "codex-auto-review", {}, "ordinary", False),
+        (
+            "/backend-api/codex/responses",
+            "codex-auto-review",
+            {"previous_response_id": "resp_explicit_owner"},
+            "bridge",
+            True,
+        ),
+        (
+            "/backend-api/codex/responses",
+            "codex-auto-review",
+            {"conversation": "conv_explicit_owner"},
+            "bridge",
+            True,
+        ),
+        ("/backend-api/codex/responses", "gpt-5.4", {}, "bridge", True),
+        ("/v1/responses", "codex-auto-review", {}, "bridge", False),
+    ],
+)
+async def test_native_guardian_http_fallback_does_not_reattach_stale_owner(
+    async_client, monkeypatch, path, model, anchor, expected_stream, expected_affinity
+):
+    calls = []
+
+    async def ordinary_stream(self, payload, headers, **kwargs):
+        calls.append(("ordinary", payload.to_payload(), dict(headers), kwargs))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_review","status":"completed","output":[]}}\n\n'
+
+    async def bridge_stream(self, payload, headers, **kwargs):
+        calls.append(("bridge", payload.to_payload(), dict(headers), kwargs))
+        yield 'data: {"type":"response.completed","response":{"id":"resp_review","status":"completed","output":[]}}\n\n'
+
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_responses", ordinary_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_http_responses", bridge_stream)
+    history = [
+        {"role": "user", "content": [{"type": "input_text", "text": "Review the first proposed action."}]},
+        {"role": "assistant", "content": [{"type": "output_text", "text": "First review completed."}]},
+        {"role": "user", "content": [{"type": "input_text", "text": "Review this new proposed action."}]},
+    ]
+    tools = [{"type": "function", "name": "evaluate", "parameters": {"type": "object"}}]
+    response = await async_client.post(
+        path,
+        json={
+            "model": model,
+            "instructions": "Keep the approval policy.",
+            "input": history,
+            "tools": tools,
+            "stream": True,
+            **anchor,
+        },
+        headers={
+            "user-agent": "codex_exec/0.170.0",
+            "session_id": "guardian_parent_session",
+            "x-codex-turn-state": "stale_team_owner",
+        },
+    )
+    assert response.status_code == 200
+    assert "response.completed" in response.text
+    assert len(calls) == 1
+    stream_kind, forwarded, headers, kwargs = calls[0]
+    assert stream_kind == expected_stream
+    assert kwargs["codex_session_affinity"] is expected_affinity
+    assert forwarded["input"] == history
+    assert forwarded["tools"] == tools
+    assert forwarded["instructions"] == "Keep the approval policy."
+    assert headers["session_id"] == "guardian_parent_session"
+    if path == "/backend-api/codex/responses" and model == "codex-auto-review" and not anchor:
+        assert "x-codex-turn-state" not in headers
+    else:
+        assert headers["x-codex-turn-state"] == "stale_team_owner"
+    for key, value in anchor.items():
+        assert forwarded[key] == value
+
+
+async def test_native_guardian_http_fallback_selects_reserve_after_quota_exhaustion(async_client, monkeypatch):
+    metadata = {"turn_id": "previous_review", "create_time": 123.5, "content_item_kinds": ["text"]}
+    history = [
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "id": "tools_inline",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "tools": [
+                        {"type": "function", "name": "evaluate", "parameters": {"type": "object"}},
+                    ],
+                },
+            ],
+        },
+        {
+            "type": "message",
+            "role": "developer",
+            "id": "policy_inline",
+            "content": [{"type": "input_text", "text": "Preserve the complete approval policy."}],
+            "internal_chat_message_metadata_passthrough": metadata,
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "id": "user_previous",
+            "content": [{"type": "input_text", "text": "Prior proposed action."}],
+        },
+        {"type": "reasoning", "id": "rs_previous", "encrypted_content": "synthetic-inline-ciphertext", "summary": []},
+        {
+            "type": "message",
+            "role": "assistant",
+            "id": "verdict_previous",
+            "phase": "final_answer",
+            "content": [{"type": "output_text", "text": "Prior review verdict."}],
+        },
+        {
+            "type": "message",
+            "role": "user",
+            "id": "user_new",
+            "content": [{"type": "input_text", "text": "Review the new proposed action."}],
+        },
+    ]
+    for account_id in ("guardian_exhausted", "guardian_reserve"):
+        response = await async_client.post(
+            "/api/accounts/import",
+            files={
+                "auth_json": (
+                    "auth.json",
+                    json.dumps(_make_auth_json(account_id, f"{account_id}@example.com")),
+                    "application/json",
+                )
+            },
+        )
+        assert response.status_code == 200
+    async with SessionLocal() as session:
+        accounts = (await session.execute(select(Account))).scalars().all()
+        for account in accounts:
+            exhausted = account.chatgpt_account_id == "guardian_exhausted"
+            if exhausted:
+                account.status = AccountStatus.RATE_LIMITED
+                account.reset_at = int(time.time()) + 3600
+                account.routing_policy = "burn_first"
+                session.add(
+                    HttpBridgeSessionRecord(
+                        id="guardian_old_bridge",
+                        session_key_kind="session_header",
+                        session_key_value="guardian_same_parent",
+                        session_key_hash=durable_bridge_hash("guardian_same_parent"),
+                        api_key_scope=durable_bridge_api_key_scope(None),
+                        owner_instance_id=proxy_module.get_settings().http_responses_session_bridge_instance_id,
+                        owner_epoch=1,
+                        lease_expires_at=utcnow() + timedelta(minutes=5),
+                        account_id=account.id,
+                        model="codex-auto-review",
+                        latest_turn_state="stale_team_owner",
+                        latest_response_id="resp_guardian_old",
+                        latest_input_item_count=3,
+                        latest_input_full_fingerprint=proxy_module._fingerprint_input_items(history[:3]),
+                    )
+                )
+                session.add(
+                    HttpBridgeSessionAlias(
+                        session_id="guardian_old_bridge",
+                        alias_kind="turn_state",
+                        alias_value="stale_team_owner",
+                        alias_hash=durable_bridge_hash("stale_team_owner"),
+                        api_key_scope=durable_bridge_api_key_scope(None),
+                    )
+                )
+            session.add(
+                UsageHistory(
+                    account_id=account.id,
+                    window="primary",
+                    used_percent=100 if exhausted else 0,
+                    recorded_at=utcnow(),
+                    reset_at=int(time.time()) + 3600,
+                    window_minutes=300,
+                )
+            )
+        await session.commit()
+    settings = proxy_module.get_settings().model_copy(
+        update={"http_responses_session_bridge_enabled": True, "upstream_stream_transport": "http"}
+    )
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: settings)
+    selected = []
+
+    async def upstream(payload, headers, access_token, account_id, **kwargs):
+        selected.append((account_id, payload.to_payload(), dict(headers)))
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_guardian_reserve",'
+            '"object":"response","status":"completed","output":[],"usage":'
+            '{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", upstream)
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        json={
+            "model": "codex-auto-review",
+            "instructions": "Apply the approval policy.",
+            "input": history,
+            "stream": True,
+            "parallel_tool_calls": False,
+            "client_metadata": {"x-openai-subagent": "guardian"},
+        },
+        headers={
+            "user-agent": "zed/0.170.0",
+            "originator": "zed",
+            "x-codex-guardian": "reviewer",
+            "session_id": "guardian_same_parent",
+            "x-codex-turn-state": "stale_team_owner",
+        },
+    )
+    assert response.status_code == 200
+    assert "resp_guardian_reserve" in response.text
+    assert len(selected) == 1
+    account_id, forwarded, headers = selected[0]
+    assert account_id == "guardian_reserve"
+    assert forwarded["input"] == history
+    assert forwarded["instructions"] == "Apply the approval policy."
+    assert "previous_response_id" not in forwarded
+    assert "x-codex-turn-state" not in headers
+    assert headers["session_id"] == "guardian_same_parent"
+    async with SessionLocal() as session:
+        old_bridge = await session.get(HttpBridgeSessionRecord, "guardian_old_bridge")
+        assert old_bridge is not None
+        assert old_bridge.latest_response_id == "resp_guardian_old"
+
+
+async def test_native_guardian_http_fallback_rejects_untrusted_capability_metadata(async_client):
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        json={
+            "model": "codex-auto-review",
+            "instructions": "Review the proposed action.",
+            "input": [{"role": "user", "content": "Proposed action."}],
+            "stream": True,
+            "client_metadata": {proxy_client_module.CODEX_LB_REQUIRED_CAPABILITY_HEADER: "trusted_cyber"},
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "capability_signal_untrusted"
+
+
+@pytest.mark.parametrize(
+    ("input_items", "extra_headers"),
+    [
+        ([{"type": "item_reference", "id": "item_old_owner"}], {}),
+        ([{"type": "function_call_output", "call_id": "missing_call", "output": "done"}], {}),
+        ([{"type": "reasoning", "encrypted_content": "opaque_old_owner", "summary": []}], {}),
+        ([{"type": "input_file", "file_id": "file_old_owner"}], {}),
+        ([{"role": "user", "content": [{"type": [], "text": "malformed discriminator"}]}], {}),
+        ([{"type": "additional_tools", "role": "developer", "tools": [{"type": {}}]}], {}),
+        (
+            [{"role": "user", "content": "Review this."}],
+            {"user-agent": "OpenAI/Python 2.0", "x-stainless-runtime": "python"},
+        ),
+    ],
+)
+async def test_guardian_http_preserves_bridge_for_nonportable_or_sdk_requests(
+    async_client, monkeypatch, input_items, extra_headers
+):
+    selected_stream = []
+
+    async def ordinary_stream(self, payload, headers, **kwargs):
+        selected_stream.append("ordinary")
+        yield 'data: {"type":"response.completed","response":{"id":"resp_guard","status":"completed","output":[]}}\n\n'
+
+    async def bridge_stream(self, payload, headers, **kwargs):
+        selected_stream.append("bridge")
+        assert headers["x-codex-turn-state"] == "existing_owner"
+        yield 'data: {"type":"response.completed","response":{"id":"resp_guard","status":"completed","output":[]}}\n\n'
+
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_responses", ordinary_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_http_responses", bridge_stream)
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        json={
+            "model": "codex-auto-review",
+            "instructions": "Apply the approval policy.",
+            "input": input_items,
+            "stream": True,
+        },
+        headers={"user-agent": "codex_exec/0.170.0", "x-codex-turn-state": "existing_owner", **extra_headers},
+    )
+    assert response.status_code == 200
+    assert selected_stream == ["bridge"]
 
 
 def _encode_jwt(payload: dict) -> str:

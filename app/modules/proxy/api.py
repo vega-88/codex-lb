@@ -234,6 +234,8 @@ from app.modules.proxy._service.support import (
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
+from app.modules.proxy.capability_routing import parse_routing_intent
+from app.modules.proxy.guardian_http import guardian_http_has_inline_full_context
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.images_observability import (
@@ -5638,6 +5640,46 @@ async def _stream_responses(
         if include_rate_limit_headers
         else {}
     )
+    direct_stream_headers: Mapping[str, str] = request.headers
+    if (
+        codex_session_affinity
+        and not forwarded_request
+        and api_key is None
+        and compact_payload is None
+        and payload.model == "codex-auto-review"
+        and payload.previous_response_id is None
+        and payload.conversation is None
+    ):
+        # Native Guardian's HTTP fallback carries its complete prompt. A bridge
+        # can reintroduce the exhausted review owner's implicit response anchor
+        # even after the main agent has switched accounts. Keep the body and
+        # ordinary file/account checks, but do not infer continuity for this new
+        # review. API-key traffic retains its capability-lineage bridge path.
+        try:
+            parse_routing_intent(
+                request.headers,
+                api_key=api_key,
+                client_metadata=(payload.model_extra or {}).get("client_metadata"),
+            )
+        except ProxyResponseError as exc:
+            return _logged_error_json_response(request, exc.status_code, exc.payload)
+        guardian_metadata = (payload.model_extra or {}).get("client_metadata")
+        guardian_protocol_marker = (
+            request.headers.get("x-codex-guardian") == "reviewer"
+            and isinstance(guardian_metadata, dict)
+            and guardian_metadata.get("x-openai-subagent") == "guardian"
+        )
+        if (
+            (native_codex_heartbeat or guardian_protocol_marker)
+            and not _has_explicit_openai_sdk_marker(request)
+            and guardian_http_has_inline_full_context(payload)
+        ):
+            prefer_http_bridge = False
+            codex_session_affinity = False
+            direct_stream_headers = {
+                name: value for name, value in request.headers.items() if name.lower() != "x-codex-turn-state"
+            }
+            logger.info("guardian_http_full_context request_id=%s mode=stateless", ensure_request_id())
     bridge_active = prefer_http_bridge and proxy_service_module.get_settings().http_responses_session_bridge_enabled
     effective_headers = forwarded_headers or request.headers
     bridge_recovery_eligible = _http_bridge_recovery_request_eligible(
@@ -5782,7 +5824,7 @@ async def _stream_responses(
             )
         return context.service.stream_responses(
             payload,
-            request.headers,
+            direct_stream_headers,
             codex_session_affinity=codex_session_affinity,
             propagate_http_errors=True,
             openai_cache_affinity=openai_cache_affinity,
