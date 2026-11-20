@@ -1233,8 +1233,20 @@ async def _select_with_stickiness(
             None,
         )
         if initial_preferred is not None:
+            # A new thread inherits locality, not ownership. Consider primary
+            # accounts before committing that soft preference, while retaining
+            # the ordinary selector's health and eligibility ordering.
+            initial_candidates = [initial_preferred]
+            if initial_preferred.routing_policy != ROUTING_POLICY_BURN_FIRST and routing_strategy not in (
+                "sequential_drain",
+                "reset_drain",
+                "single_account",
+            ):
+                initial_candidates.extend(
+                    state for state in states if state.routing_policy == ROUTING_POLICY_BURN_FIRST
+                )
             initial_result = select_account(
-                [initial_preferred],
+                initial_candidates,
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
                 routing_strategy=routing_strategy,
@@ -1250,7 +1262,7 @@ async def _select_with_stickiness(
                 # the preference but is deliberately outside this mutation.
                 return finish_selection(
                     initial_result,
-                    persist_account_id=initial_preferred.account_id,
+                    persist_account_id=initial_result.account.account_id,
                 )
 
     if existing:

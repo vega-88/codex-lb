@@ -2985,6 +2985,76 @@ async def test_new_codex_thread_is_seeded_from_process_preference_without_rewrit
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "available",
+        "rate_limited",
+        "excluded",
+        "scoped",
+        "stream_cap",
+        "existing_thread",
+        "required_owner",
+        "sequential_drain",
+        "reset_drain",
+        "single_account",
+    ],
+)
+async def test_new_thread_burn_first_priority_respects_process_and_owner_boundaries(scenario: str) -> None:
+    balancer, reserve, primary, sticky_repo = _make_cap_spillover_balancer("thread-burn-first-" + scenario)
+    assert primary is not None
+    primary.routing_policy = "burn_first"
+    process_session = "burn-first-process-" + scenario
+    process_key = _codex_session_selection_key(process_session)
+    thread_key = _codex_backend_identity(
+        {"session-id": process_session, "thread-id": "new-burn-first-thread"}
+    ).thread_selection_key
+    assert thread_key is not None
+    sticky_repo.account_ids_by_key = {process_key: reserve.id}
+    if scenario == "existing_thread":
+        sticky_repo.account_ids_by_key[thread_key] = reserve.id
+    if scenario == "rate_limited":
+        primary.status = AccountStatus.RATE_LIMITED
+        primary.blocked_at = time.time()
+        primary.reset_at = int(time.time()) + 3600
+    leases = (
+        [await balancer.acquire_account_lease(primary.id, kind="stream") for _ in range(8)]
+        if scenario == "stream_cap"
+        else []
+    )
+    selected = None
+    try:
+        selected = await balancer.select_account(
+            sticky_key=thread_key,
+            sticky_kind=StickySessionKind.PROMPT_CACHE,
+            sticky_source="thread_header",
+            legacy_sticky_key=process_session,
+            sticky_seed_key=process_key,
+            sticky_seed_kind=StickySessionKind.CODEX_SESSION,
+            sticky_max_age_seconds=300,
+            routing_strategy=(
+                scenario if scenario in {"sequential_drain", "reset_drain", "single_account"} else "capacity_weighted"
+            ),
+            exclude_account_ids=[primary.id] if scenario == "excluded" else None,
+            account_ids=[reserve.id] if scenario == "scoped" else None,
+            required_account_id=reserve.id if scenario == "required_owner" else None,
+            required_account_is_ownership_constraint=scenario == "required_owner",
+            lease_kind="stream",
+        )
+        expected = primary.id if scenario == "available" else reserve.id
+        assert selected.account is not None
+        assert selected.account.id == expected
+        assert sticky_repo.account_ids_by_key[process_key] == reserve.id
+        assert sticky_repo.account_ids_by_key[thread_key] == expected
+        assert sticky_repo.deleted == []
+    finally:
+        if selected is not None and selected.lease is not None:
+            await balancer.release_account_lease(selected.lease)
+        for lease in leases:
+            await balancer.release_account_lease(lease)
+
+
+@pytest.mark.asyncio
 async def test_first_codex_thread_initializes_process_preference_once_for_later_siblings() -> None:
     balancer, owner, alternate, sticky_repo = _make_cap_spillover_balancer("thread-first-process")
     assert alternate is not None

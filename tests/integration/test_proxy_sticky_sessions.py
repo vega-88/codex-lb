@@ -1040,6 +1040,50 @@ async def test_proxy_codex_session_id_pins_responses_and_compact_without_sticky_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["responses", "compact"])
+async def test_new_backend_thread_prefers_burn_first_over_process_seed(async_client, monkeypatch, route):
+    from app.modules.proxy.sticky_repository import StickySessionsRepository
+
+    await _set_routing_settings(async_client, sticky_threads_enabled=False)
+    reserve_id = await _import_account(async_client, "acc_seed_reserve", "seed-reserve@example.com")
+    primary_id = await _import_account(async_client, "acc_seed_primary", "seed-primary@example.com")
+    headers = {"session-id": "burn-first-seeded-process", "thread-id": "burn-first-new-thread"}
+    process_key = _codex_session_selection_key(headers["session-id"])
+    thread_key = _codex_backend_identity(headers).thread_selection_key
+    assert thread_key is not None
+    async with SessionLocal() as session:
+        await session.execute(update(Account).where(Account.id == primary_id).values(routing_policy="burn_first"))
+        await session.commit()
+        await StickySessionsRepository(session).upsert(process_key, reserve_id, kind=StickySessionKind.CODEX_SESSION)
+
+    observed = []
+
+    async def fake_stream(payload, headers, access_token, account_id, **kwargs):
+        observed.append(account_id)
+        yield 'data: {"type":"response.completed","response":{"id":"resp_burn_first_new_thread"}}\n\n'
+
+    async def fake_compact(payload, headers, access_token, account_id):
+        observed.append(account_id)
+        return OpenAIResponsePayload.model_validate({"output": []})
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fake_compact)
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": []}
+    path = "/backend-api/codex/responses"
+    if route == "responses":
+        payload["stream"] = True
+    else:
+        path += "/compact"
+    response = await async_client.post(path, json=payload, headers=headers)
+    assert response.status_code == 200
+    assert observed == ["acc_seed_primary"]
+    async with SessionLocal() as session:
+        repo = StickySessionsRepository(session)
+        assert await repo.get_account_id(process_key, kind=StickySessionKind.CODEX_SESSION) == reserve_id
+        assert await repo.get_account_id(thread_key, kind=StickySessionKind.PROMPT_CACHE) == primary_id
+
+
+@pytest.mark.asyncio
 async def test_backend_thread_rows_route_sibling_responses_and_compact_independently(
     async_client,
     monkeypatch,
