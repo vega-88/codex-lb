@@ -1,9 +1,13 @@
 # Prefer burn-first accounts for newly seeded threads
 
+## Why
+
 A new Codex thread can inherit a normal account from its process preference
 before manual routing policy is considered, even when an eligible burn_first
 account has recovered its quota. This makes a fresh thread consume reserve
 capacity despite the operator's manual priority.
+
+## What Changes
 
 For a previously unmapped thread, consider eligible burn_first accounts together
 with the inherited preference using existing account selection. Keep the process

@@ -83,3 +83,15 @@ short windows, or evaluated for a quota the plan does not have.
 Settlement is discarded if newer replica-local runtime activity arrives while
 that snapshot is loading, preventing an older probe success from clearing a
 later failure.
+
+## New logical threads and process preference
+
+A previously unmapped native Codex thread treats the process account as a soft
+locality preference. Strategies honoring manual priority consider eligible
+`burn_first` accounts together with that preference through the ordinary
+selector, preserving health, quota, model, scope and cap gates. The selected
+account is stored only on the new thread; the process preference stays intact.
+Existing thread and explicit response/file/turn-state ownership retain their
+existing behavior. Fixed-order strategies keep their process-seeding semantics.
+For example, after primary A recovers its quota, a process that prefers reserve
+B starts a new thread on A while an existing selectable sibling stays on B.

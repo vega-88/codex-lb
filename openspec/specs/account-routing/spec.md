@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change add-relative-availability-routing. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Relative availability routing
 
 The proxy account selector SHALL support a `relative_availability` routing strategy. The strategy SHALL evaluate only accounts that have passed the existing eligibility, health-tier, model-plan, quota, cooldown, circuit-breaker, and budget-safety gates. Re-authentication-required accounts SHALL be treated as hard-blocked routing candidates, the same as paused and deactivated accounts. For each candidate, it SHALL compute a raw score from remaining secondary-window credits divided by seconds until the secondary-window reset, using bounded fallbacks for unknown or near-immediate reset times, and SHALL select from the highest weighted candidates according to the configured power and top-K cutoff.
@@ -744,3 +746,34 @@ an owner, or fall back to an ordinary account.
 - **THEN** selection receives the same scope, strategy, ownership, admission,
   and retry inputs as before this change
 
+### Requirement: New thread seeding respects manual burn-first priority
+For a previously unmapped Codex thread, strategies honoring manual routing
+priority SHALL consider eligible burn_first accounts before inheriting a normal
+or preserved process preference. Existing health, quota, scope and cap gates
+SHALL remain enforced. Only the new thread mapping SHALL be persisted.
+
+#### Scenario: Primary account recovers before a new thread
+- **GIVEN** a process preference names a normal account
+- **AND** an eligible burn_first account is available
+- **WHEN** a new unmapped thread selects its account
+- **THEN** ordinary account selection considers the burn_first account
+- **AND** the process preference remains unchanged
+
+#### Scenario: Primary account is unavailable or outside scope
+- **GIVEN** the burn_first account fails quota, scope or local cap checks
+- **WHEN** the new thread selects its account
+- **THEN** the inherited selectable preference remains usable
+- **AND** no eligibility gate is bypassed
+
+### Requirement: Existing ownership and strategy boundaries remain intact
+Existing thread mappings and required response/file/turn-state ownership SHALL
+retain their existing selection behavior. Fixed-order strategies SHALL preserve
+their existing process-seeding semantics.
+
+#### Scenario: Existing thread or required owner names the reserve account
+- **WHEN** a thread already has a selectable mapping or requires an account owner
+- **THEN** burn_first priority does not override that existing ownership path
+
+#### Scenario: Fixed-order routing strategy seeds a new thread
+- **WHEN** the strategy is sequential_drain, reset_drain or single_account
+- **THEN** the existing inherited-preference behavior is preserved
